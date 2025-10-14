@@ -21,6 +21,8 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET; // Your 42 App Client Secret
 const REDIRECT_URI = process.env.REDIRECT_URI; 
 const APP_ID = process.env.APP_ID; // Discord Application ID
 
+const verificationStates = new Map();
+
 // Initialize Discord client
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -53,31 +55,95 @@ client.once('ready', async () => {
     // Call register commands after logging in
     await registerCommands(); 
 
-    // Logic to send the verification button in the channel
+
+    // Keep only the successful verification button sending logic, 
+    // but modify the button to be an Action Button
     try {
         const guild = await client.guilds.fetch(GUILD_ID);
         const channel = await guild.channels.fetch(CHANNEL_ID);
 
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
-                .setLabel('Verify with 42')
-                .setStyle(ButtonStyle.Link)
-                .setURL(
-                    `https://api.intra.42.fr/oauth/authorize?client_id=${CLIENT_ID_42}&redirect_uri=${encodeURIComponent(
-                        REDIRECT_URI
-                    )}&response_type=code`
-                )
+                .setLabel('Start Verification') // Changed label
+                .setStyle(ButtonStyle.Secondary) // Changed style from Link to Secondary
+                .setCustomId('start_42_verification') // CRITICAL: Added Custom ID
         );
 
         await channel.send({
-            content: 'Click the button below to verify your student status:',
+            content: 'Click the button below to start the verification process:',
             components: [row],
         });
     } catch (error) {
-        console.error('Error setting up verification button:', error);
+        console.error('Error setting up permanent verification button:', error);
     }
+
 });
 
+// Register the Interaction Listener
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isCommand() || interaction.commandName !== 'verify') return;
+    
+    // --- Step 1: Generate Secure State ---
+    const discordUserId = interaction.user.id;
+    // Create a simple, random state value
+    const state = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    
+    // 2. Save the state linked to the user's Discord ID for later lookup
+    verificationStates.set(state, discordUserId);
+
+    // 3. Construct the 42 OAuth URL with the 'state' appended
+    const authUrl = 
+        `https://api.intra.42.fr/oauth/authorize?client_id=${CLIENT_ID_42}` +
+        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+        `&response_type=code` +
+        `&state=${state}`; // <-- Include the state
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setLabel('Verify with 42')
+            .setStyle(ButtonStyle.Link)
+            .setURL(authUrl)
+    );
+
+    await interaction.reply({
+        content: 'Click the button below to verify your student status:',
+        components: [row],
+        ephemeral: true // Only the user who ran the command can see this
+    });
+});
+
+
+// New Interaction Listener for the permanent button click
+client.on('interactionCreate', async (interaction) => {
+    // Check if it's the custom button we just created
+    if (interaction.isButton() && interaction.customId === 'start_42_verification') {
+        
+        // Use the exact same logic as the slash command handler
+        const discordUserId = interaction.user.id;
+        const state = Math.random().toString(36).substring(2) + Date.now().toString(36);
+        verificationStates.set(state, discordUserId);
+
+        const authUrl = 
+            `https://api.intra.42.fr/oauth/authorize?client_id=${CLIENT_ID_42}` +
+            `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+            `&response_type=code` +
+            `&state=${state}`; 
+        
+        // Send the secure link privately to the user who clicked the button
+        const linkRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setLabel('Verify with 42 Intra')
+                .setStyle(ButtonStyle.Link)
+                .setURL(authUrl)
+        );
+
+        await interaction.reply({
+            content: 'Click the link button below to complete verification:',
+            components: [linkRow],
+            ephemeral: true // Only the user who clicked sees this private message
+        });
+    }
+});
 
 // --- Express Server Setup (The Web Component) ---
 const app = express();
@@ -89,59 +155,90 @@ app.get('/', (req, res) => {
     res.send('42 Verification Bot is running!'); 
 });
 
-// OAuth callback route (exact same as your original server.js)
 // OAuth callback route
 app.get('/callback', async (req, res) => {
     const code = req.query.code;
+    const state = req.query.state; // Get the state parameter
+
+    // --- Step 1: Validate State and Retrieve User ID ---
+    const discordUserId = verificationStates.get(state);
+
+    if (!discordUserId) {
+        // If state is missing or doesn't match a stored session, it's a security failure
+        return res.status(401).send('Verification failed: Invalid or missing security state. Try running /verify again in Discord.');
+    }
+    
+    // Clean up the stored state immediately after use
+    verificationStates.delete(state);
 
     if (!code) {
-        // IMPORTANT: Add state validation here if 42 supports it!
-        return res.status(400).send('No code provided in query.');
+        return res.status(400).send('No authorization code provided.');
     }
 
-    // Exchange code for access token
+    // --- Step 2: Exchange Code for Access Token (Your Existing Logic) ---
     try {
         const tokenResponse = await fetch('https://api.intra.42.fr/oauth/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
                 grant_type: 'authorization_code',
-                client_id: CLIENT_ID_42, // Use the 42 ID variable
+                client_id: CLIENT_ID_42, 
                 client_secret: CLIENT_SECRET,
                 code,
                 redirect_uri: REDIRECT_URI,
+                // Note: The 'state' is not strictly required in the token exchange POST body, but is used for security validation in Step 1.
             }),
         });
 
-        // --- NEW TROUBLESHOOTING LOGIC START ---
         const tokenData = await tokenResponse.json();
-
         if (!tokenResponse.ok) {
-            // Log the HTTP status and the error payload from 42 API
-            console.error('--- 42 API ERROR RESPONSE ---');
-            console.error('HTTP Status:', tokenResponse.status);
-            console.error('Error Payload:', tokenData);
-            console.error('-----------------------------');
-            
-            // Send a helpful message back to the user
-            return res.status(500).send(`Verification failed: Error Status ${tokenResponse.status}. Please inform the server admin.`);
+            console.error('42 API ERROR:', tokenData);
+            return res.status(500).send(`Verification failed. Error: ${tokenData.error_description || 'API Error'}`);
         }
-        // --- NEW TROUBLESHOOTING LOGIC END ---
-
-        console.log('Token exchange successful. Token Data:', tokenData);
-
-        // Your verification logic (e.g., getting user info from 42 API) goes here!
-
-        res.send('Verification successful! You can close this tab.');
-    } catch (err) {
-        console.error('--- CRITICAL UNCAUGHT ERROR ---');
-        console.error('Error Type:', err.name || 'Unknown');
-        console.error('Error Message:', err.message || 'No message provided');
-        console.error('Full Error Object:', err); // Log the entire object
-        console.error('-----------------------------');
         
-        // This sends the error message to the browser, helping you debug if needed
-        res.status(500).send(`An unexpected server error occurred: ${err.message || 'Check Server Logs'}`);
+        const accessToken = tokenData.access_token;
+
+        // --- Step 3: Fetch Student Data (Get Proof of Status) ---
+        const userDataResponse = await fetch('https://api.intra.42.fr/v2/me', {
+            headers: { 'Authorization': `Bearer ${accessToken}` },
+        });
+        const userData = await userDataResponse.json();
+
+        // **CRITICAL: Add your student status check here**
+        // e.g., if (userData.status === 'alumni') return res.status(403).send('Verification failed: You are no longer an active student.');
+
+        
+        // --- Step 4: Grant Role on Discord ---
+        const guild = client.guilds.cache.get(GUILD_ID);
+        if (!guild) {
+            console.error(`Guild not found: ${GUILD_ID}`);
+            return res.status(500).send('Verification error: Discord server not found.');
+        }
+
+        const member = await guild.members.fetch(discordUserId);
+        
+        const memberRoleId = process.env.MEMBER_ROLE_ID;
+        const newcomerRoleId = process.env.NEWCOMER_ROLE_ID; 
+
+        // 4.1. Add the new role
+        await member.roles.add(memberRoleId);
+        
+        // 4.2. Remove the old role (Safely)
+        // Check if the member actually has the role before attempting removal
+        if (member.roles.cache.has(newcomerRoleId)) {
+            await member.roles.remove(newcomerRoleId);
+        }
+        
+        // Send a direct message confirmation
+        member.send(`✅ Verification complete! Welcome to the student channels. Your old role has been updated.`);
+
+
+        // Final successful response to the user's browser
+        res.send('Verification successful! You can close this tab and check Discord.');
+
+    } catch (err) {
+        console.error('Uncaught Error in /callback:', err);
+        res.status(500).send('An unexpected server error occurred. Check Discord for details.');
     }
 });
 
