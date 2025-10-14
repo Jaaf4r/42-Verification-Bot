@@ -134,8 +134,14 @@ app.get('/callback', async (req, res) => {
 
         res.send('Verification successful! You can close this tab.');
     } catch (err) {
-        console.error('Network or Uncaught Error:', err);
-        res.status(500).send('An unexpected server error occurred during token exchange.');
+        console.error('--- CRITICAL UNCAUGHT ERROR ---');
+        console.error('Error Type:', err.name || 'Unknown');
+        console.error('Error Message:', err.message || 'No message provided');
+        console.error('Full Error Object:', err); // Log the entire object
+        console.error('-----------------------------');
+        
+        // This sends the error message to the browser, helping you debug if needed
+        res.status(500).send(`An unexpected server error occurred: ${err.message || 'Check Server Logs'}`);
     }
 });
 
