@@ -90,6 +90,7 @@ app.get('/', (req, res) => {
 });
 
 // OAuth callback route (exact same as your original server.js)
+// OAuth callback route
 app.get('/callback', async (req, res) => {
     const code = req.query.code;
 
@@ -102,7 +103,6 @@ app.get('/callback', async (req, res) => {
     try {
         const tokenResponse = await fetch('https://api.intra.42.fr/oauth/token', {
             method: 'POST',
-            // ... (keep the rest of your exchange logic the same)
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
                 grant_type: 'authorization_code',
@@ -113,15 +113,29 @@ app.get('/callback', async (req, res) => {
             }),
         });
 
+        // --- NEW TROUBLESHOOTING LOGIC START ---
         const tokenData = await tokenResponse.json();
-        console.log(tokenData);
+
+        if (!tokenResponse.ok) {
+            // Log the HTTP status and the error payload from 42 API
+            console.error('--- 42 API ERROR RESPONSE ---');
+            console.error('HTTP Status:', tokenResponse.status);
+            console.error('Error Payload:', tokenData);
+            console.error('-----------------------------');
+            
+            // Send a helpful message back to the user
+            return res.status(500).send(`Verification failed: Error Status ${tokenResponse.status}. Please inform the server admin.`);
+        }
+        // --- NEW TROUBLESHOOTING LOGIC END ---
+
+        console.log('Token exchange successful. Token Data:', tokenData);
 
         // Your verification logic (e.g., getting user info from 42 API) goes here!
 
         res.send('Verification successful! You can close this tab.');
     } catch (err) {
-        console.error(err);
-        res.status(500).send('Error exchanging code for token.');
+        console.error('Network or Uncaught Error:', err);
+        res.status(500).send('An unexpected server error occurred during token exchange.');
     }
 });
 
